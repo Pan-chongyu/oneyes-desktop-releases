@@ -1,0 +1,307 @@
+name: Build and publish desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Private source tag to build (for example v0.1.23)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: oneyes-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Pan-chongyu/oneyes-desktop
+  RELEASE_REPO: Pan-chongyu/oneyes-desktop-releases
+  REQUIRED_PLATFORMS: windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64-appimage,linux-x86_64-deb,linux-x86_64-rpm
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            target: ""
+            bundle_root: src-tauri/target/release/bundle
+            bundles: nsis
+          - platform: darwin-x86_64
+            os: macos-14
+            target: x86_64-apple-darwin
+            bundle_root: src-tauri/target/x86_64-apple-darwin/release/bundle
+            bundles: app,dmg
+          - platform: darwin-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            bundle_root: src-tauri/target/aarch64-apple-darwin/release/bundle
+            bundles: app,dmg
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundle_root: src-tauri/target/x86_64-unknown-linux-gnu/release/bundle
+            bundles: appimage,deb,rpm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout private source tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev libdbus-1-dev \
+            patchelf rpm file xvfb dbus-x11
+      - run: npm ci
+      - name: Validate source version and release tag
+        env:
+          RELEASE_VERSION: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: npm run release:version
+      - name: Validate release tooling
+        run: npm run test:release
+      - name: Test desktop logic
+        run: npm test
+      - name: Install Rust target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+      - name: Validate Tauri signing secrets
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || { echo '::error::Missing TAURI_SIGNING_PRIVATE_KEY'; exit 1; }
+          test -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" || { echo '::error::Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD'; exit 1; }
+      - name: Validate Sparkle signing secrets
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${SPARKLE_PRIVATE_KEY:-}" || { echo '::error::Missing SPARKLE_PRIVATE_KEY'; exit 1; }
+          test -n "${SPARKLE_PUBLIC_ED_KEY:-}" || { echo '::error::Missing SPARKLE_PUBLIC_ED_KEY'; exit 1; }
+      - name: Download Sparkle 2 framework and tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sparkle_version="2.9.6"
+          sparkle_sha256="52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192"
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/Sparkle.tar.xz" "https://github.com/sparkle-project/Sparkle/releases/download/$sparkle_version/Sparkle-$sparkle_version.tar.xz"
+          printf '%s  %s\n' "$sparkle_sha256" "$RUNNER_TEMP/Sparkle.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/Sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+          cp -R "$RUNNER_TEMP/sparkle/Sparkle.framework" "$GITHUB_WORKSPACE/src-tauri/Sparkle.framework"
+          cp -R "$RUNNER_TEMP/sparkle/bin" "$GITHUB_WORKSPACE/src-tauri/sparkle-bin"
+          chmod +x "$GITHUB_WORKSPACE/src-tauri/sparkle-bin"/*
+      - name: Configure Sparkle public key
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          test "$SPARKLE_PUBLIC_ED_KEY" = "$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' src-tauri/Info.plist)"
+          feed="appcast-darwin-x86_64.xml"
+          [[ "${{ matrix.platform }}" == "darwin-aarch64" ]] && feed="appcast-darwin-aarch64.xml"
+          /usr/libexec/PlistBuddy -c "Set :SUFeedURL https://github.com/${{ env.RELEASE_REPO }}/releases/latest/download/$feed" src-tauri/Info.plist
+      - name: Test Linux backend
+        if: runner.os == 'Linux'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Build signed Tauri bundle
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.target }}" ]]; then
+            npm run tauri build -- --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}" -- --locked
+          else
+            npm run tauri build -- --bundles "${{ matrix.bundles }}" -- --locked
+          fi
+      - name: Verify Windows executable and live application icons
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_ICON_TEST_EXE: src-tauri/target/release/oneyes-desktop.exe
+        run: npm run test:release
+      - name: Verify packaged macOS icon and code signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$(find "${{ matrix.bundle_root }}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app"
+          icon="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")"
+          [[ "$icon" == *.icns ]] || icon="$icon.icns"
+          cmp src-tauri/icons/icon.icns "$app/Contents/Resources/$icon"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          details="$(codesign --display --verbose=4 "$app" 2>&1)"
+          grep -q 'Identifier=ai.oneyes.desktop' <<<"$details"
+          grep -Eq 'Signature=adhoc|Authority=Developer ID Application:' <<<"$details"
+      - name: Smoke test packaged macOS Sparkle startup
+        if: runner.os == 'macOS'
+        shell: bash
+        run: python3 scripts/smoke-macos-sparkle.py "${{ matrix.bundle_root }}/macos/OneYes.app"
+      - name: Smoke test Linux startup
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+        run: |
+          set +e
+          dbus-run-session -- xvfb-run -a timeout 15s src-tauri/target/${{ matrix.target }}/release/oneyes-desktop
+          result=$?
+          if [[ "$result" -ne 124 ]]; then
+            echo "::error::Linux app exited during the startup smoke test (exit $result)."
+            exit 1
+          fi
+      - name: Collect and verify updater files
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          output="release/${{ matrix.platform }}"
+          mkdir -p "$output"
+          find "${{ matrix.bundle_root }}" -type f \( -name '*.sig' -o -name '*.app.tar.gz' -o -name '*.dmg' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} "$output/" \;
+          if [[ "${{ matrix.platform }}" == windows-* ]]; then
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.exe.sig' -print -quit)"
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.exe' -print -quit)"
+          elif [[ "${{ matrix.platform }}" == linux-* ]]; then
+            for extension in AppImage deb rpm; do
+              test -n "$(find "$output" -maxdepth 1 -type f -name "*.$extension.sig" -print -quit)"
+              test -n "$(find "$output" -maxdepth 1 -type f -name "*.$extension" -print -quit)"
+            done
+          else
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.app.tar.gz.sig' -print -quit)"
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+            updater="$(find "$output" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+            mv "$updater" "$output/OneYes_${{ matrix.platform }}.app.tar.gz"
+            mv "$updater.sig" "$output/OneYes_${{ matrix.platform }}.app.tar.gz.sig"
+            dmg="$(find "$output" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+            test -n "$dmg"
+            sparkle_file="$output/OneYes_${{ matrix.platform }}.dmg"
+            mv "$dmg" "$sparkle_file"
+            sparkle_key_file="$RUNNER_TEMP/sparkle-private-key"
+            printf '%s\n' "$SPARKLE_PRIVATE_KEY" > "$sparkle_key_file"
+            chmod 600 "$sparkle_key_file"
+            trap 'rm -f "$sparkle_key_file"' EXIT
+            sparkle_signature="$("$GITHUB_WORKSPACE/src-tauri/sparkle-bin/sign_update" "$sparkle_file" -f "$sparkle_key_file" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')"
+            test -n "$sparkle_signature"
+            sparkle_length="$(stat -f '%z' "$sparkle_file")"
+            printf '{"file":"%s","signature":"%s","length":%s}\n' "$(basename "$sparkle_file")" "$sparkle_signature" "$sparkle_length" > "$output/sparkle.json"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: release
+          if-no-files-found: error
+
+  publish:
+    name: Publish to public release repository
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private source tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate source version and release tag
+        env:
+          RELEASE_VERSION: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: npm run release:version
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Verify build output
+        run: npm run release:assets
+      - name: Build updater manifest
+        env:
+          RELEASE_VERSION: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REPO: ${{ env.RELEASE_REPO }}
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          notes="docs/releases/$tag.zh-CN.md"
+          if [[ -f "$notes" ]]; then export RELEASE_NOTES="$(cat "$notes")"; fi
+          node scripts/build-update-manifest.mjs
+      - name: Build Sparkle 2 appcast
+        env:
+          RELEASE_VERSION: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REPO: ${{ env.RELEASE_REPO }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          notes="docs/releases/$tag.zh-CN.md"
+          if [[ -f "$notes" ]]; then export RELEASE_NOTES="$(cat "$notes")"; fi
+          node scripts/build-sparkle-appcast.mjs
+      - name: Validate updater manifest
+        env:
+          RELEASE_VERSION: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REQUIRED_PLATFORMS: ${{ env.REQUIRED_PLATFORMS }}
+        run: npm run release:validate
+      - name: Publish assets to this public repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ env.RELEASE_REPO }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find release -mindepth 2 -maxdepth 2 -type f ! -name 'sparkle.json' -print | sort)
+          files+=(release/latest.json release/appcast-darwin-x86_64.xml release/appcast-darwin-aarch64.xml)
+          test "${#files[@]}" -ge 17
+          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --repo "$RELEASE_REPO" --clobber
+          else
+            notes="docs/releases/$RELEASE_TAG.zh-CN.md"
+            if [[ -f "$notes" ]]; then
+              gh release create "$RELEASE_TAG" "${files[@]}" --repo "$RELEASE_REPO" --title "OneYes Desktop $RELEASE_TAG" --notes-file "$notes"
+            else
+              gh release create "$RELEASE_TAG" "${files[@]}" --repo "$RELEASE_REPO" --title "OneYes Desktop $RELEASE_TAG" --notes "跨平台安装包与 OTA 更新清单。"
+            fi
+          fi
+      - name: Label release systems and installer downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPO: ${{ env.RELEASE_REPO }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: node scripts/label-github-releases.mjs
