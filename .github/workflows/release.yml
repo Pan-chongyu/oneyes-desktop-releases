@@ -171,6 +171,22 @@ jobs:
       - name: Test Linux backend
         if: runner.os == 'Linux'
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Verify macOS credentials do not depend on Keychain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked --manifest-path src-tauri/Cargo.toml --target "${{ matrix.target }}" --prefix none -e normal > "$RUNNER_TEMP/macos-dependencies.txt"
+          if grep -Eq '^keyring v' "$RUNNER_TEMP/macos-dependencies.txt"; then
+            echo '::error::The macOS credential backend must not depend on keyring.'
+            exit 1
+          fi
+      - name: Test macOS local credentials and encrypted session restart
+        if: runner.os == 'macOS'
+        env:
+          SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+          DYLD_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Build signed Tauri bundle
         shell: bash
         env:
