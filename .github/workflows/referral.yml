@@ -1,0 +1,316 @@
+name: Build personalized referral installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Management platform build UUID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: referral-${{ inputs.job }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Pan-chongyu/oneyes-desktop
+  RELEASE_REPO: Pan-chongyu/oneyes-desktop-releases
+
+jobs:
+  prepare:
+    name: Claim authorized source commit
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.claim.outputs.commit }}
+      tag: ${{ steps.claim.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: claim
+        env:
+          REFERRAL_JOB: ${{ inputs.job }}
+          REFERRAL_ACTION: claim
+          REFERRAL_BUILD_CALLBACK_KEY: ${{ secrets.REFERRAL_BUILD_CALLBACK_KEY }}
+        run: node .github/scripts/referral-worker.mjs
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            target: ""
+            bundle_root: src-tauri/target/release/bundle
+            bundles: nsis
+          - platform: darwin-x86_64
+            os: macos-14
+            target: x86_64-apple-darwin
+            bundle_root: src-tauri/target/x86_64-apple-darwin/release/bundle
+            bundles: app,dmg
+          - platform: darwin-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            bundle_root: src-tauri/target/aarch64-apple-darwin/release/bundle
+            bundles: app,dmg
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundle_root: src-tauri/target/x86_64-unknown-linux-gnu/release/bundle
+            bundles: appimage,deb,rpm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout private source tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.commit }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev libdbus-1-dev \
+            patchelf rpm file xvfb dbus-x11
+      - run: npm ci
+      - name: Validate source version and release tag
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: npm run release:version
+      - name: Validate release tooling
+        run: npm run test:release
+      - name: Test desktop logic
+        run: npm test
+      - name: Install Rust target
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
+      - name: Validate Tauri signing secrets
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || { echo '::error::Missing TAURI_SIGNING_PRIVATE_KEY'; exit 1; }
+          test -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" || { echo '::error::Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD'; exit 1; }
+      - name: Validate Sparkle signing secrets
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${SPARKLE_PRIVATE_KEY:-}" || { echo '::error::Missing SPARKLE_PRIVATE_KEY'; exit 1; }
+          test -n "${SPARKLE_PUBLIC_ED_KEY:-}" || { echo '::error::Missing SPARKLE_PUBLIC_ED_KEY'; exit 1; }
+      - name: Download Sparkle 2 framework and tools
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sparkle_version="2.9.6"
+          sparkle_sha256="52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192"
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/Sparkle.tar.xz" "https://github.com/sparkle-project/Sparkle/releases/download/$sparkle_version/Sparkle-$sparkle_version.tar.xz"
+          printf '%s  %s\n' "$sparkle_sha256" "$RUNNER_TEMP/Sparkle.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/Sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+          cp -R "$RUNNER_TEMP/sparkle/Sparkle.framework" "$GITHUB_WORKSPACE/src-tauri/Sparkle.framework"
+          cp -R "$RUNNER_TEMP/sparkle/bin" "$GITHUB_WORKSPACE/src-tauri/sparkle-bin"
+          chmod +x "$GITHUB_WORKSPACE/src-tauri/sparkle-bin"/*
+      - name: Configure Sparkle public key
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          test "$SPARKLE_PUBLIC_ED_KEY" = "$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' src-tauri/Info.plist)"
+          feed="appcast-darwin-x86_64.xml"
+          [[ "${{ matrix.platform }}" == "darwin-aarch64" ]] && feed="appcast-darwin-aarch64.xml"
+          /usr/libexec/PlistBuddy -c "Set :SUFeedURL https://github.com/${{ env.RELEASE_REPO }}/releases/latest/download/$feed" src-tauri/Info.plist
+      - name: Test Linux backend
+        if: runner.os == 'Linux'
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }}
+      - name: Verify macOS credentials do not depend on Keychain
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree --locked --manifest-path src-tauri/Cargo.toml --target "${{ matrix.target }}" --prefix none -e normal > "$RUNNER_TEMP/macos-dependencies.txt"
+          if grep -Eq '^keyring v' "$RUNNER_TEMP/macos-dependencies.txt"; then
+            echo '::error::The macOS credential backend must not depend on keyring.'
+            exit 1
+          fi
+      - name: Test macOS local credentials and encrypted session restart
+        if: runner.os == 'macOS'
+        env:
+          SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+          DYLD_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Build signed Tauri bundle
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.target }}" ]]; then
+            npm run tauri build -- --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}" -- --locked
+          else
+            npm run tauri build -- --bundles "${{ matrix.bundles }}" -- --locked
+          fi
+      - name: Verify Windows executable and live application icons
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_ICON_TEST_EXE: src-tauri/target/release/oneyes-desktop.exe
+        run: npm run test:release
+      - name: Verify packaged macOS icon and code signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$(find "${{ matrix.bundle_root }}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app"
+          icon="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")"
+          [[ "$icon" == *.icns ]] || icon="$icon.icns"
+          cmp src-tauri/icons/icon.icns "$app/Contents/Resources/$icon"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          details="$(codesign --display --verbose=4 "$app" 2>&1)"
+          grep -q 'Identifier=ai.oneyes.desktop' <<<"$details"
+          grep -Eq 'Signature=adhoc|Authority=Developer ID Application:' <<<"$details"
+      - name: Smoke test packaged macOS Sparkle startup
+        if: runner.os == 'macOS'
+        shell: bash
+        run: python3 scripts/smoke-macos-sparkle.py "${{ matrix.bundle_root }}/macos/OneYes.app"
+      - name: Smoke test Linux startup
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+        run: |
+          set +e
+          dbus-run-session -- xvfb-run -a timeout 15s src-tauri/target/${{ matrix.target }}/release/oneyes-desktop
+          result=$?
+          if [[ "$result" -ne 124 ]]; then
+            echo "::error::Linux app exited during the startup smoke test (exit $result)."
+            exit 1
+          fi
+      - name: Collect and verify updater files
+        shell: bash
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          output="release/${{ matrix.platform }}"
+          mkdir -p "$output"
+          find "${{ matrix.bundle_root }}" -type f \( -name '*.sig' -o -name '*.app.tar.gz' -o -name '*.dmg' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} "$output/" \;
+          if [[ "${{ matrix.platform }}" == windows-* ]]; then
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.exe.sig' -print -quit)"
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.exe' -print -quit)"
+          elif [[ "${{ matrix.platform }}" == linux-* ]]; then
+            for extension in AppImage deb rpm; do
+              test -n "$(find "$output" -maxdepth 1 -type f -name "*.$extension.sig" -print -quit)"
+              test -n "$(find "$output" -maxdepth 1 -type f -name "*.$extension" -print -quit)"
+            done
+          else
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.app.tar.gz.sig' -print -quit)"
+            test -n "$(find "$output" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+            updater="$(find "$output" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit)"
+            mv "$updater" "$output/OneYes_${{ matrix.platform }}.app.tar.gz"
+            mv "$updater.sig" "$output/OneYes_${{ matrix.platform }}.app.tar.gz.sig"
+            dmg="$(find "$output" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+            test -n "$dmg"
+            sparkle_file="$output/OneYes_${{ matrix.platform }}.dmg"
+            mv "$dmg" "$sparkle_file"
+            sparkle_key_file="$RUNNER_TEMP/sparkle-private-key"
+            printf '%s\n' "$SPARKLE_PRIVATE_KEY" > "$sparkle_key_file"
+            chmod 600 "$sparkle_key_file"
+            trap 'rm -f "$sparkle_key_file"' EXIT
+            sparkle_signature="$("$GITHUB_WORKSPACE/src-tauri/sparkle-bin/sign_update" "$sparkle_file" -f "$sparkle_key_file" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')"
+            test -n "$sparkle_signature"
+            sparkle_length="$(stat -f '%z' "$sparkle_file")"
+            printf '{"file":"%s","signature":"%s","length":%s}\n' "$(basename "$sparkle_file")" "$sparkle_signature" "$sparkle_length" > "$output/sparkle.json"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: release
+          if-no-files-found: error
+
+  publish:
+    name: Publish isolated share installers
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.prepare.outputs.commit }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - run: npm run release:assets
+      - name: Publish without changing stable OTA feeds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REFERRAL_JOB: ${{ inputs.job }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REFERRAL_JOB" =~ ^[a-f0-9-]{36}$ ]]
+          for arch in x86_64 aarch64; do
+            cp "release/darwin-$arch/sparkle.json" "release/darwin-$arch/sparkle-darwin-$arch.json"
+          done
+          mapfile -t files < <(find release -mindepth 2 -maxdepth 2 -type f ! -name 'sparkle.json' -print | sort)
+          test "${#files[@]}" -eq 16
+          tag="referral-$REFERRAL_JOB"
+          if gh release view "$tag" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --repo "$RELEASE_REPO" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --repo "$RELEASE_REPO" --prerelease --latest=false --title "OneYes 专属邀请客户端" --notes "Windows x64、macOS Apple Silicon / Intel、Linux x64。内含分享者返利码，注册时可查看和修改。应用继续使用正式 OTA 通道。"
+          fi
+
+  report:
+    name: Report verified download metadata
+    needs: [prepare, build, publish]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - env:
+          REFERRAL_JOB: ${{ inputs.job }}
+          REFERRAL_ACTION: report
+          REFERRAL_BUILD_CALLBACK_KEY: ${{ secrets.REFERRAL_BUILD_CALLBACK_KEY }}
+          BUILD_RESULT: ${{ needs.publish.result }}
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/referral-worker.mjs
