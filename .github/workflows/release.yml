@@ -310,6 +310,15 @@ jobs:
           merge-multiple: true
       - name: Verify build output
         run: npm run release:assets
+      - name: Build cross-version OTA deltas
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_REPO: ${{ env.RELEASE_REPO }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run release:deltas
       - name: Build updater manifest
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
@@ -348,7 +357,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t files < <(find release -mindepth 2 -maxdepth 2 -type f ! -name 'sparkle.json' -print | sort)
+          mapfile -t files < <(find release -mindepth 2 -maxdepth 2 -type f ! -name 'sparkle.json' ! -name 'incremental-*.json' -print | sort)
           files+=(release/latest.json release/appcast-darwin-x86_64.xml release/appcast-darwin-aarch64.xml)
           test "${#files[@]}" -ge 17
           if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
