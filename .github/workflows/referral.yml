@@ -161,6 +161,36 @@ jobs:
           SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
           DYLD_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Prepare Windows publisher signing
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_SIGNING_MODE: ${{ vars.WINDOWS_SIGNING_MODE }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: node scripts/release-signing.mjs prepare
+      - name: Prepare macOS publisher signing
+        if: runner.os == 'macOS'
+        env:
+          MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: node scripts/release-signing.mjs prepare
+      - name: Prepare Linux OTA signing
+        if: runner.os == 'Linux'
+        run: node scripts/release-signing.mjs prepare
+      - name: Import trusted Windows code-signing certificate
+        if: runner.os == 'Windows' && env.ONEYES_SIGNING_MODE == 'pfx'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: ./scripts/windows-signing.ps1 -Action Prepare
       - name: Build signed Tauri bundle
         shell: bash
         env:
@@ -169,13 +199,34 @@ jobs:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
           SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          if [[ -n "${{ matrix.target }}" ]]; then
-            npm run tauri build -- --target "${{ matrix.target }}" --bundles "${{ matrix.bundles }}" -- --locked
-          else
-            npm run tauri build -- --bundles "${{ matrix.bundles }}" -- --locked
+          if [[ "$ONEYES_SIGNING_MODE" != developer-id ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
           fi
+          if [[ -n "${{ matrix.target }}" ]]; then
+            npm run tauri build -- --target "${{ matrix.target }}" --config "$ONEYES_SIGNING_CONFIG" --bundles "${{ matrix.bundles }}" -- --locked
+          else
+            npm run tauri build -- --config "$ONEYES_SIGNING_CONFIG" --bundles "${{ matrix.bundles }}" -- --locked
+          fi
+      - name: Verify Windows publisher and timestamp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: ./scripts/windows-signing.ps1 -Action Verify -BundleRoot "${{ matrix.bundle_root }}"
+      - name: Verify macOS publisher and notarization
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: node scripts/macos-signing.mjs "${{ matrix.bundle_root }}" "${{ matrix.platform }}"
       - name: Verify Windows executable and live application icons
         if: runner.os == 'Windows'
         env:
@@ -249,6 +300,12 @@ jobs:
             sparkle_length="$(stat -f '%z' "$sparkle_file")"
             printf '{"file":"%s","signature":"%s","length":%s}\n' "$(basename "$sparkle_file")" "$sparkle_signature" "$sparkle_length" > "$output/sparkle.json"
           fi
+      - name: Verify OTA cryptography and record publisher status
+        run: node scripts/release-signing.mjs report "${{ matrix.platform }}"
+      - name: Remove imported Windows certificate
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/windows-signing.ps1 -Action Cleanup
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
@@ -277,6 +334,8 @@ jobs:
           path: release
           merge-multiple: true
       - run: npm run release:assets
+      - name: Verify complete signing inventory
+        run: node scripts/release-signing.mjs summary
       - name: Publish without changing stable OTA feeds
         env:
           GH_TOKEN: ${{ github.token }}
@@ -288,8 +347,9 @@ jobs:
           for arch in x86_64 aarch64; do
             cp "release/darwin-$arch/sparkle.json" "release/darwin-$arch/sparkle-darwin-$arch.json"
           done
-          mapfile -t files < <(find release -mindepth 2 -maxdepth 2 -type f ! -name 'sparkle.json' -print | sort)
-          test "${#files[@]}" -eq 16
+          mapfile -t files < <(find release -mindepth 2 -maxdepth 2 -type f ! -name 'sparkle.json' ! -name 'signing-*.json' -print | sort)
+          files+=(release/signing-status.json)
+          test "${#files[@]}" -eq 17
           tag="referral-$REFERRAL_JOB"
           if gh release view "$tag" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
             gh release upload "$tag" "${files[@]}" --repo "$RELEASE_REPO" --clobber
