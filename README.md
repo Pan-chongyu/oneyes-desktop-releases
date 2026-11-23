@@ -1,6 +1,12 @@
 # oneyes-desktop-releases
 Official OneYes Desktop installers and signed update manifests. No application source or credentials.
 
+## Personalized builds
+
+Personalized installers use the same Windows, native Intel macOS, native Apple Silicon macOS and Linux runners as the stable workflow. `node --test .github/scripts/referral-workflow.test.mjs` checks runner compatibility, signed asset inventory and stable feed isolation before a job is claimed. Keep both platform matrices aligned when runner images are retired.
+
+The management platform can retry an approved failed job up to three build attempts, preserving its original source commit and invitation attribution. Every dispatch supplies an attempt number to both signed claim and report callbacks; callbacks from older attempts cannot update the new build. Retry through the management platform so the authorization fence and audit trail remain consistent. Personalized releases remain prereleases with `--latest=false` and do not replace stable OTA manifests or appcasts.
+
 ## Downloads
 
 Open the [latest release](https://github.com/Pan-chongyu/oneyes-desktop-releases/releases/latest) and choose your system and CPU architecture. Installed clients use the signed `latest.json` (Windows/Linux) or architecture-specific Sparkle 2 appcasts (macOS).

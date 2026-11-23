@@ -5,7 +5,9 @@ const id = process.env.REFERRAL_JOB
 if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id || '')) throw new Error('Invalid job ID')
 const secret = process.env.REFERRAL_BUILD_CALLBACK_KEY
 if (!secret || secret.length < 32) throw new Error('Missing callback key')
-const data = { id, action: process.env.REFERRAL_ACTION, run_id: process.env.GITHUB_RUN_ID }
+const attempt = Number(process.env.REFERRAL_ATTEMPT)
+if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > 3) throw new Error('Invalid build attempt')
+const data = { id, action: process.env.REFERRAL_ACTION, run_id: process.env.GITHUB_RUN_ID, attempt }
 if (data.action === 'report') {
   data.success = process.env.BUILD_RESULT === 'success'
   if (data.success) {
