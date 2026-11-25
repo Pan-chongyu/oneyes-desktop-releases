@@ -234,6 +234,12 @@ jobs:
           SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
           DYLD_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Verify official Codex desktop HTTP compatibility
+        if: matrix.platform == 'darwin-aarch64' && hashFiles('scripts/test-codex-desktop-compat.mjs') != ''
+        env:
+          SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+          DYLD_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+        run: node scripts/test-codex-desktop-compat.mjs
       - name: Prepare Windows publisher signing
         if: runner.os == 'Windows'
         env:
