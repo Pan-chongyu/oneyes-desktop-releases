@@ -9,9 +9,15 @@ on:
         description: Private source tag to build (for example v0.1.23)
         required: true
         type: string
+      artifacts_run_id:
+        description: Optional completed release run with verified artifacts for the exact source commit
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: oneyes-public-release
@@ -30,7 +36,14 @@ jobs:
       tag: ${{ steps.source.outputs.tag }}
       commit: ${{ steps.source.outputs.commit }}
       build: ${{ steps.source.outputs.build }}
+      artifacts_run_id: ${{ steps.reuse.outputs.run_id }}
     steps:
+      - name: Validate public publication recovery rules
+        uses: actions/checkout@v4
+        with:
+          path: .release-policy
+          persist-credentials: false
+      - run: node --test .release-policy/scripts/release.test.mjs
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
@@ -62,11 +75,45 @@ jobs:
           appendFileSync(process.env.GITHUB_OUTPUT, `tag=${tag}\ncommit=${commit}\nbuild=${build}\n`);
           console.log(build ? `Building ${tag} (${commit})` : `${tag} is already published`);
           NODE
+      - name: Validate an optional verified artifact recovery run
+        id: reuse
+        if: inputs.artifacts_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACTS_RUN_ID: ${{ inputs.artifacts_run_id }}
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+          const runId = process.env.ARTIFACTS_RUN_ID;
+          if (!/^\d+$/.test(runId)) throw new Error('Invalid artifact run ID');
+          const gh = (...args) => execFileSync('gh', args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+          const root = `repos/${process.env.GITHUB_REPOSITORY}`;
+          const run = JSON.parse(gh('api', `${root}/actions/runs/${runId}`));
+          if (run.status !== 'completed' || run.event !== 'workflow_dispatch' || !run.path.endsWith('/release.yml')) throw new Error('Recovery requires a completed standard release run');
+          const jobs = JSON.parse(gh('api', `${root}/actions/runs/${runId}/jobs?per_page=100`)).jobs;
+          for (const name of ['Build windows-x86_64', 'Build linux-x86_64', 'Build darwin-x86_64', 'Build darwin-aarch64']) {
+            if (!jobs.some(job => job.name === name && job.conclusion === 'success')) throw new Error(`Missing successful ${name}`);
+          }
+          const prepare = jobs.find(job => job.name === 'Resolve private source release tag' && job.conclusion === 'success');
+          if (!prepare) throw new Error('Missing successful source resolution');
+          const log = gh('api', `${root}/actions/jobs/${prepare.id}/logs`, '--allow-escape-sequences');
+          if (!log.includes(`Building ${process.env.SOURCE_TAG} (${process.env.SOURCE_COMMIT})`)) throw new Error('Artifacts do not match the exact private source commit');
+          const artifacts = JSON.parse(gh('api', `${root}/actions/runs/${runId}/artifacts?per_page=100`)).artifacts;
+          for (const platform of ['windows-x86_64', 'linux-x86_64', 'darwin-x86_64', 'darwin-aarch64']) {
+            if (!artifacts.some(artifact => artifact.name === `release-${platform}` && !artifact.expired)) throw new Error(`Missing artifact ${platform}`);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `run_id=${runId}\n`);
+          console.log(`Revalidating signed artifacts from ${runId} for ${process.env.SOURCE_TAG}`);
+          NODE
 
   build:
     name: Build ${{ matrix.platform }}
     needs: prepare
-    if: needs.prepare.outputs.build == 'true'
+    if: needs.prepare.outputs.build == 'true' && needs.prepare.outputs.artifacts_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -394,9 +441,11 @@ jobs:
   publish:
     name: Publish to public release repository
     needs: [prepare, build]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.build == 'true' && (needs.build.result == 'success' || needs.prepare.outputs.artifacts_run_id != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
       - name: Checkout private source tag
         uses: actions/checkout@v4
@@ -418,6 +467,8 @@ jobs:
           pattern: release-*
           path: release
           merge-multiple: true
+          run-id: ${{ needs.prepare.outputs.artifacts_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Verify build output
         run: npm run release:assets
       - name: Verify complete signing inventory
@@ -472,15 +523,44 @@ jobs:
           mapfile -t files < <(find release -mindepth 2 -maxdepth 2 -type f ! -name 'sparkle.json' ! -name 'incremental-*.json' ! -name 'signing-*.json' -print | sort)
           files+=(release/signing-status.json release/latest.json release/appcast-darwin-x86_64.xml release/appcast-darwin-aarch64.xml)
           test "${#files[@]}" -ge 18
-          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${files[@]}" --repo "$RELEASE_REPO" --clobber
-          else
+          # Upload into a draft; a failed upload never changes the public OTA.
+          if ! gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
             notes="docs/releases/$RELEASE_TAG.zh-CN.md"
             if [[ -f "$notes" ]]; then
-              gh release create "$RELEASE_TAG" "${files[@]}" --repo "$RELEASE_REPO" --title "OneYes Desktop $RELEASE_TAG" --notes-file "$notes"
+              gh release create "$RELEASE_TAG" --draft --repo "$RELEASE_REPO" --title "OneYes Desktop $RELEASE_TAG" --notes-file "$notes"
             else
-              gh release create "$RELEASE_TAG" "${files[@]}" --repo "$RELEASE_REPO" --title "OneYes Desktop $RELEASE_TAG" --notes "跨平台安装包与 OTA 更新清单。"
+              gh release create "$RELEASE_TAG" --draft --repo "$RELEASE_REPO" --title "OneYes Desktop $RELEASE_TAG" --notes "跨平台安装包与 OTA 更新清单。"
             fi
+          fi
+          draft="$(gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" --json isDraft --jq .isDraft)"
+          if [[ "$draft" == true ]]; then
+            for file in "${files[@]}"; do
+              uploaded=false
+              for attempt in 1 2 3; do
+                if gh release upload "$RELEASE_TAG" "$file" --repo "$RELEASE_REPO" --clobber; then uploaded=true; break; fi
+                sleep "$((attempt * 2))"
+              done
+              [[ "$uploaded" == true ]] || exit 1
+            done
+          fi
+          # Refuse duplicate names, missing assets or size/digest mismatches.
+          # Already published versions are verified and never overwritten.
+          gh release view "$RELEASE_TAG" --repo "$RELEASE_REPO" --json assets > "$RUNNER_TEMP/oneyes-published-assets.json"
+          node --input-type=module - "$RUNNER_TEMP/oneyes-published-assets.json" "${files[@]}" <<'NODE'
+          import { readFileSync, statSync } from 'node:fs';
+          import { basename } from 'node:path';
+          import { createHash } from 'node:crypto';
+          const [inventory, ...files] = process.argv.slice(2);
+          const assets = JSON.parse(readFileSync(inventory, 'utf8')).assets;
+          if (new Set(files.map(file => basename(file))).size !== files.length || assets.length !== files.length) throw new Error('Release asset count mismatch');
+          for (const file of files) {
+            const asset = assets.find(asset => asset.name === basename(file));
+            if (!asset || asset.size !== statSync(file).size) throw new Error(`Missing or incomplete ${basename(file)}`);
+            if (asset.digest && asset.digest !== `sha256:${createHash('sha256').update(readFileSync(file)).digest('hex')}`) throw new Error(`Digest mismatch ${basename(file)}`);
+          }
+          NODE
+          if [[ "$draft" == true ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPO" --draft=false --latest
           fi
       - name: Label release systems and installer downloads
         env:
