@@ -1,0 +1,41 @@
+name: Verify official Codex compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source commit to verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Pan-chongyu/oneyes-desktop
+          ref: ${{ inputs.source_ref }}
+          ssh-key: ${{ secrets.SOURCE_REPO_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare verified Sparkle framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/Sparkle.tar.xz" 'https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz'
+          printf '%s  %s\n' '52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192' "$RUNNER_TEMP/Sparkle.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/Sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+          cp -R "$RUNNER_TEMP/sparkle/Sparkle.framework" "$GITHUB_WORKSPACE/src-tauri/Sparkle.framework"
+      - name: Verify signed official desktop and existing chat recovery
+        env:
+          SPARKLE_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+          DYLD_FRAMEWORK_PATH: ${{ github.workspace }}/src-tauri
+        run: node scripts/test-codex-desktop-compat.mjs
